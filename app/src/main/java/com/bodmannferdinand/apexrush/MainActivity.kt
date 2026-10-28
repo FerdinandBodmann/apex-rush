@@ -1102,8 +1102,8 @@ object Meshes {
             at = emitTri(d, at, 0.5f, ys[k], zs[k], -0.5f, ys[k], zs[k], -0.5f, ys[k2], zs[k2])
             at = emitTri(d, at, 0.5f, ys[k], zs[k], -0.5f, ys[k2], zs[k2], 0.5f, ys[k2], zs[k2])
             // caps
-            at = emitTri(d, at, 0.5f, 0f, 0f, ys[k], zs[k], 0.5f, ys[k2], zs[k2])
-            at = emitTri(d, at, -0.5f, 0f, 0f, ys[k2], zs[k2], -0.5f, ys[k], zs[k])
+            at = emitTri(d, at, 0.5f, 0f, 0f, 0.5f, ys[k], zs[k], 0.5f, ys[k2], zs[k2])
+            at = emitTri(d, at, -0.5f, 0f, 0f, -0.5f, ys[k2], zs[k2], -0.5f, ys[k], zs[k])
         }
         return d
     }
