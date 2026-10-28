@@ -125,7 +125,7 @@ class Save(ctx: Context) {
     var coins = 800
     val spec = CarSpec()
     val upg = Upg()
-    var best = longArrayOf(-1L, -1L, -1L)
+    var best = longArrayOf(-1L, -1L, -1L, -1L, -1L, -1L)
     var track = 0
 
     fun load() {
@@ -135,9 +135,9 @@ class Save(ctx: Context) {
         val b = prefs.getString("best", null)
         if (b != null) {
             val parts = b.split(",")
-            for (i in 0 until 3) if (i < parts.size) best[i] = parts[i].toLongOrNull() ?: -1L
+            for (i in 0 until 6) if (i < parts.size) best[i] = parts[i].toLongOrNull() ?: -1L
         }
-        track = prefs.getInt("track", 0)
+        track = min(prefs.getInt("track", 0), THEMES.size - 1)
     }
 
     fun save() {
@@ -187,6 +187,7 @@ class Theme(
     val rumble1: Int, val rumble2: Int,
     val lane: Int, val fog: Int,
     val night: Boolean, val city: Boolean, val snow: Boolean,
+    val rain: Boolean, val lightning: Boolean,
     val scenery: IntArray, val accent: Int
 )
 
@@ -198,7 +199,7 @@ val THEMES = arrayOf(
         0xFF4A4A52.toInt(), 0xFF45454D.toInt(),
         0xFFF5F5F5.toInt(), 0xFFE53935.toInt(),
         0xFFEDEDED.toInt(), 0xFFE8996B.toInt(),
-        false, false, false,
+        false, false, false, false, false,
         intArrayOf(0, 1, 2), 0xFFFF6D00.toInt()),
     Theme("Neon City", 0xFF07071A.toInt(), 0xFF33104C.toInt(),
         0xFFB2EBF2.toInt(), 0.72f, 0.16f, 0.05f,
@@ -207,7 +208,7 @@ val THEMES = arrayOf(
         0xFF26262E.toInt(), 0xFF212229.toInt(),
         0xFFF50057.toInt(), 0xFF00E5FF.toInt(),
         0xFF9FE8FF.toInt(), 0xFF0A0A18.toInt(),
-        true, true, false,
+        true, true, false, false, false,
         intArrayOf(3, 4), 0xFF00E5FF.toInt()),
     Theme("Alpine Pass", 0xFF1E5FBF.toInt(), 0xFFA8D8F0.toInt(),
         0xFFFFF3C4.toInt(), 0.30f, 0.14f, 0.05f,
@@ -216,17 +217,47 @@ val THEMES = arrayOf(
         0xFF3E3E46.toInt(), 0xFF393941.toInt(),
         0xFFE53935.toInt(), 0xFFF5F5F5.toInt(),
         0xFFF5F5F5.toInt(), 0xFFC8DCF0.toInt(),
-        false, false, true,
-        intArrayOf(5, 1), 0xFF2E7D32.toInt()
+        false, false, true, false, false,
+        intArrayOf(5, 1), 0xFF2E7D32.toInt()),
+    Theme("Desert Heat", 0xFF1565C0.toInt(), 0xFFFFCC80.toInt(),
+        0xFFFFF59D.toInt(), 0.50f, 0.12f, 0.07f,
+        0xFF9E7B5A.toInt(), 0xFF7A5B44.toInt(),
+        0xFFD9B166.toInt(), 0xFFCEA55C.toInt(),
+        0xFF4E4A46.toInt(), 0xFF484441.toInt(),
+        0xFFF5F5F5.toInt(), 0xFFE53935.toInt(),
+        0xFFF5F5F5.toInt(), 0xFFE8C98A.toInt(),
+        false, false, false, false, false,
+        intArrayOf(6, 1, 2), 0xFFF57F17.toInt()),
+    Theme("Emerald Forest", 0xFF33606E.toInt(), 0xFFA8C6B0.toInt(),
+        0xFFEAFBEA.toInt(), 0.35f, 0.18f, 0.05f,
+        0xFF395E4B.toInt(), 0xFF254A38.toInt(),
+        0xFF1F5E33.toInt(), 0xFF1A5329.toInt(),
+        0xFF3A3D40.toInt(), 0xFF35383B.toInt(),
+        0xFFF5F5F5.toInt(), 0xFF4CAF50.toInt(),
+        0xFFE8F5E9.toInt(), 0xFF7FA58C.toInt(),
+        false, false, false, true, false,
+        intArrayOf(5, 5, 1), 0xFF4CAF50.toInt()),
+    Theme("Midnight Storm", 0xFF050510.toInt(), 0xFF1B2340.toInt(),
+        0xFFE1E8F0.toInt(), 0.68f, 0.20f, 0.045f,
+        0xFF0B0F1E.toInt(), 0xFF111730.toInt(),
+        0xFF0E1420.toInt(), 0xFF0C111A.toInt(),
+        0xFF22242E.toInt(), 0xFF1E2028.toInt(),
+        0xFF80D8FF.toInt(), 0xFF2962FF.toInt(),
+        0xFFB3E5FC.toInt(), 0xFF0A0E1A.toInt(),
+        true, true, false, true, true,
+        intArrayOf(4, 3), 0xFF448AFF.toInt()
     )
 )
+
+// difficulty rating (1..6) used in track select + AI pacing
+val TRACK_RATING = intArrayOf(1, 2, 2, 3, 4, 5)
 
 // ------------------------- track -------------------------
 
 const val SEG_LEN = 200f
 const val ROAD_W = 2200f
 const val RUMBLE_LEN = 3
-const val DRAW_DIST = 240
+const val DRAW_DIST = 280
 const val CAM_H = 1050f
 const val CAM_DEPTH = 0.8391f          // 1 / tan(50 deg)
 const val PLAYER_Z = CAM_H * CAM_DEPTH
@@ -254,6 +285,39 @@ class Seg(val index: Int, val p1: ProjPoint, val p2: ProjPoint) {
 class Track(val themeIdx: Int, val segments: Array<Seg>) {
     val length = segments.size * SEG_LEN
     val theme: Theme get() = THEMES[themeIdx]
+
+    // Real 2D map of the circuit: the per-segment curvature is integrated
+    // into a driven path (heading += curve * k), then normalized to 0..1.
+    // This is the actual track geometry used for minimaps — not a picture.
+    val mapX = FloatArray(segments.size)
+    val mapY = FloatArray(segments.size)
+
+    init {
+        val k = 0.03f
+        var hx = 0f
+        var hy = 0f
+        var heading = 0f
+        var minX = 0f; var maxX = 0f
+        var minY = 0f; var maxY = 0f
+        for (i in segments.indices) {
+            mapX[i] = hx
+            mapY[i] = hy
+            hx += cos(heading)
+            hy += sin(heading)
+            heading += segments[i].curve * k
+            if (hx < minX) minX = hx
+            if (hx > maxX) maxX = hx
+            if (hy < minY) minY = hy
+            if (hy > maxY) maxY = hy
+        }
+        val cx = (minX + maxX) * 0.5f
+        val cy = (minY + maxY) * 0.5f
+        val s = 1f / maxOf(maxX - minX, maxY - minY, 1f)
+        for (i in segments.indices) {
+            mapX[i] = 0.5f + (mapX[i] - cx) * s
+            mapY[i] = 0.5f + (mapY[i] - cy) * s
+        }
+    }
 }
 
 object TrackBuilder {
@@ -312,7 +376,7 @@ object TrackBuilder {
                 addRoad(25, 35, 25, -4.4f, 0f)
                 addRoad(25, 40, 25, 3.2f, 0f)
             }
-            else -> { // Alpine Pass: long sweepers, huge climbs
+            2 -> { // Alpine Pass: long sweepers, huge climbs
                 addRoad(30, 50, 30, 0f, 0f)
                 addRoad(50, 80, 50, 2.0f, 30f)
                 addRoad(40, 60, 40, -2.8f, 22f)
@@ -324,17 +388,64 @@ object TrackBuilder {
                 addRoad(35, 60, 35, 2.6f, 6f)
                 addRoad(50, 70, 50, 0f, -16f)
             }
+            3 -> { // Desert Heat: fast banked sweepers over dunes
+                addRoad(30, 60, 30, 0f, 0f)
+                addRoad(40, 70, 40, 2.8f, 10f)
+                addRoad(30, 40, 30, -2.4f, -14f)
+                addRoad(50, 90, 50, 3.8f, 22f)
+                addRoad(30, 30, 30, -4.6f, -10f)
+                addRoad(40, 60, 40, 1.6f, 16f)
+                addRoad(35, 45, 35, -3.0f, -24f)
+                addRoad(45, 75, 45, 4.0f, 12f)
+                addRoad(30, 40, 30, -3.8f, -12f)
+            }
+            4 -> { // Emerald Forest: tight technical twisties
+                addRoad(25, 50, 25, 0f, 0f)
+                addRoad(25, 30, 25, -3.4f, 6f)
+                addRoad(20, 25, 20, 4.8f, -4f)
+                addRoad(30, 40, 30, -2.2f, 12f)
+                addRoad(20, 20, 20, 5.2f, 4f)
+                addRoad(25, 35, 25, -4.4f, -8f)
+                addRoad(35, 50, 35, 2.6f, 10f)
+                addRoad(20, 25, 20, -5.0f, -6f)
+                addRoad(25, 30, 25, 3.6f, -10f)
+                addRoad(30, 45, 30, -2.8f, 0f)
+            }
+            else -> { // Midnight Storm: huge straights + big sweepers
+                addRoad(40, 80, 40, 0f, 0f)
+                addRoad(30, 60, 30, 3.2f, 6f)
+                addRoad(60, 100, 60, -1.6f, -12f)
+                addRoad(25, 35, 25, 5.4f, 8f)
+                addRoad(50, 90, 50, 2.2f, -14f)
+                addRoad(25, 30, 25, -5.2f, 10f)
+                addRoad(60, 110, 60, 0f, -8f)
+                addRoad(35, 55, 35, 3.4f, 16f)
+                addRoad(40, 60, 40, -3.0f, -6f)
+            }
         }
         addRoad(30, 60, 30, 0f, -lastY / SEG_LEN) // glide back to start height
 
         val arr = segs.toTypedArray()
         val theme = THEMES[themeIdx]
         val rng = Rng(1234 + themeIdx * 77)
-        for (i in 8 until arr.size step 5) {
+        val dens = if (themeIdx == 4) 4 else 5
+        for (i in 8 until arr.size step dens) {
             if (rng.next() < 0.55f) {
                 val type = theme.scenery[rng.int(theme.scenery.size)]
                 val side = if (rng.next() < 0.5f) -1f else 1f
                 arr[i].sprites.add(Sprite(type, side * rng.range(1.5f, 3.2f), rng.range(0.8f, 1.4f)))
+            }
+        }
+        // start/finish gantry + mid-track gantries to drive under
+        arr[1].sprites.add(Sprite(7, 0f, 8f))
+        for (i in 280 until arr.size - 8 step 280) {
+            arr[i].sprites.add(Sprite(7, 0f, 8f))
+        }
+        // chevron corner boards on the outside of sharp corners
+        for (i in 12 until arr.size step 7) {
+            val cv = arr[i].curve
+            if (abs(cv) > 2.8f) {
+                arr[i].sprites.add(Sprite(8, if (cv > 0f) -1.45f else 1.45f, 1.25f))
             }
         }
         return Track(themeIdx, arr)
@@ -649,6 +760,33 @@ class GameView(context: Context) : View(context) {
     private var skyShader: Shader? = null
     private var skyShaderTheme = -1
 
+    // track cache + minimap paths (real track geometry)
+    private val trackCache = arrayOfNulls<Track>(THEMES.size)
+    private val mmPath = Path()
+    private var mmTrack: Track? = null
+    private val selectPaths = arrayOfNulls<Path>(THEMES.size)
+    private var flash = 0f   // lightning flash (storm theme)
+
+    private fun trackFor(i: Int): Track {
+        var t = trackCache[i]
+        if (t == null) { t = TrackBuilder.build(i); trackCache[i] = t }
+        return t!!
+    }
+
+    private fun circuitPath(i: Int): Path {
+        var p = selectPaths[i]
+        if (p == null) {
+            p = Path()
+            val tr = trackFor(i)
+            for (k in 0 until tr.segments.size step 6) {
+                if (k == 0) p.moveTo(tr.mapX[k], tr.mapY[k]) else p.lineTo(tr.mapX[k], tr.mapY[k])
+            }
+            p.lineTo(tr.mapX[0], tr.mapY[0])
+            selectPaths[i] = p
+        }
+        return p!!
+    }
+
     // ui
     private val uiButtons = ArrayList<Triple<String, RectF, Boolean>>()
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -772,7 +910,7 @@ class GameView(context: Context) : View(context) {
     // ================= race =================
 
     private fun startRace() {
-        track = TrackBuilder.build(save.track)
+        track = trackFor(save.track)
         playerPos = 0f; playerX = 0f; speed = 0f
         lapCount = 0; raceTime = 0L; countdown = 3.99f
         nitro = 100f; boosting = false; finishT = -1f; paused = false
@@ -784,7 +922,7 @@ class GameView(context: Context) : View(context) {
             s.chassis = rng.int(3); s.paint = rng.int(PAINTS.size)
             s.finish = rng.int(4); s.rim = rng.int(5); s.rimColor = rng.int(RIM_COLORS.size)
             s.spoiler = rng.int(3); s.stripes = rng.int(3)
-            val diff = 0.80f + save.track * 0.03f
+            val diff = 0.78f + save.track * 0.028f
             val base = BASE_MAX_SPEED * rng.range(diff, diff + 0.12f)
             val n = Npc(s, (i + 1) * 260f + 140f, (i % 3 - 1) * 0.55f, base)
             n.total = n.z
@@ -917,6 +1055,18 @@ class GameView(context: Context) : View(context) {
                 if (s.x < -10f) s.x = w
             }
         }
+        if (tr.theme.rain) {
+            for (s in snow) {
+                s.x += s.vx * dt * 1.6f
+                s.y += s.vy * dt * (2.2f + speed / BASE_MAX_SPEED * 2f)
+                if (s.y > h) { s.y = -20f; s.x = rng.next() * w }
+                if (s.x < -10f) s.x = w
+            }
+        }
+        if (tr.theme.lightning) {
+            if (flash > 0f) flash -= dt
+            else if (rng.next() < dt * 0.06f) flash = 0.45f
+        }
     }
 
     private fun finishRace(tr: Track) {
@@ -1008,6 +1158,7 @@ class GameView(context: Context) : View(context) {
         val rumP = Paint()
         val laneP = Paint()
         val fogP = Paint()
+        val edgeP = Paint()
         val startP = Paint(Paint.ANTI_ALIAS_FLAG)
 
         for (i in 0 until DRAW_DIST) {
@@ -1037,6 +1188,13 @@ class GameView(context: Context) : View(context) {
             poly(c, p1.sx + p1.sw + r1, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx + p2.sw + r2, p2.sy, rumP)
             roadP.color = if (alt) theme.road1 else theme.road2
             poly(c, p1.sx - p1.sw, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx - p2.sw, p2.sy, roadP)
+            if (theme.night) { // glowing edge markers
+                edgeP.color = U.withA(theme.accent, if (alt) 140 else 85)
+                val e1 = p1.sw * 0.022f
+                val e2 = p2.sw * 0.022f
+                poly(c, p1.sx - p1.sw, p1.sy, p1.sx - p1.sw + e1, p1.sy, p2.sx - p2.sw + e2, p2.sy, p2.sx - p2.sw, p2.sy, edgeP)
+                poly(c, p1.sx + p1.sw - e1, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx + p2.sw - e2, p2.sy, edgeP)
+            }
             if (seg.index == 1) {
                 startP.color = 0xFFEEEEEE.toInt()
                 poly(c, p1.sx - p1.sw, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx - p2.sw, p2.sy, startP)
@@ -1071,7 +1229,7 @@ class GameView(context: Context) : View(context) {
             for (sp in seg.sprites) {
                 val sx = segX[i] + segW[i] * sp.offset
                 val sc = segW[i] * 0.15f * sp.scale
-                if (segY[i] < segClip[i] + 4f) drawScenery(c, sp.type, sx, segY[i], sc, a, theme)
+                if (segY[i] < segClip[i] + 4f) drawScenery(c, sp.type, sx, segY[i], sc, a, theme, sp.offset)
             }
             val npc = npcAtSeg[i]
             if (npc != null) {
@@ -1091,6 +1249,12 @@ class GameView(context: Context) : View(context) {
             val sp = Paint(Paint.ANTI_ALIAS_FLAG)
             sp.color = U.withA(0xFFFFFFFF.toInt(), 150)
             for (s in snow) c.drawCircle(s.x, s.y, s.size, sp)
+        }
+        if (theme.rain) {
+            val rp = Paint(Paint.ANTI_ALIAS_FLAG)
+            rp.color = U.withA(0xFF9FC9E8.toInt(), 110)
+            rp.strokeWidth = 2.2f
+            for (s in snow) c.drawLine(s.x, s.y, s.x + 1.5f, s.y + s.size * 6f, rp)
         }
 
         for (pt in particles) {
@@ -1122,6 +1286,14 @@ class GameView(context: Context) : View(context) {
             }
         }
 
+        if (theme.lightning && flash > 0f) {
+            val fa = (U.clamp(flash, 0f, 0.45f) / 0.45f * 220f).toInt()
+            paint.reset()
+            paint.isAntiAlias = true
+            paint.color = U.withA(0xFFCFE8FF.toInt(), fa)
+            c.drawRect(0f, 0f, w, h, paint)
+        }
+
         drawHud(c)
         if (countdown > 0f) drawCountdown(c)
         if (paused) drawPause(c)
@@ -1129,7 +1301,7 @@ class GameView(context: Context) : View(context) {
 
     // ================= scenery =================
 
-    private fun drawScenery(c: Canvas, type: Int, x: Float, y: Float, s: Float, alpha: Int, theme: Theme) {
+    private fun drawScenery(c: Canvas, type: Int, x: Float, y: Float, s: Float, alpha: Int, theme: Theme, offsetSign: Float = 0f) {
         if (s < 0.4f) return
         val p = Paint(Paint.ANTI_ALIAS_FLAG)
         when (type) {
@@ -1218,6 +1390,59 @@ class GameView(context: Context) : View(context) {
                 gp.shader = RadialGradient(hx, y - s * 1.75f, s * 0.6f,
                     U.withA(0xFFFFECB3.toInt(), alpha / 3), U.withA(0xFFFFECB3.toInt(), 0), Shader.TileMode.CLAMP)
                 c.drawCircle(hx, y - s * 1.75f, s * 0.6f, gp)
+            }
+            6 -> { // saguaro cactus
+                val tw = s * 0.14f
+                p.color = U.withA(0xFF388E3C.toInt(), alpha)
+                c.drawRoundRect(RectF(x - tw, y - s * 1.7f, x + tw, y), tw, tw, p)
+                p.color = U.withA(0xFF2E7D32.toInt(), alpha)
+                // left arm
+                c.drawRoundRect(RectF(x - s * 0.5f, y - s * 1.0f, x - tw, y - s * 0.86f), tw, tw, p)
+                c.drawRoundRect(RectF(x - s * 0.5f, y - s * 1.35f, x - s * 0.36f, y - s * 1.0f), tw, tw, p)
+                // right arm
+                c.drawRoundRect(RectF(x + tw, y - s * 0.8f, x + s * 0.5f, y - s * 0.66f), tw, tw, p)
+                c.drawRoundRect(RectF(x + s * 0.36f, y - s * 1.5f, x + s * 0.5f, y - s * 0.8f), tw, tw, p)
+            }
+            7 -> { // overhead gantry spanning the road
+                val pw = s * 0.07f
+                val ph = s * 0.62f
+                p.color = U.withA(0xFF37474F.toInt(), alpha)
+                c.drawRect(RectF(x - s, y - ph, x - s + pw, y), p)
+                c.drawRect(RectF(x + s - pw, y - ph, x + s, y), p)
+                val bh = s * 0.13f
+                val cw2 = s * 2f / 12f
+                for (k in 0 until 12) { // checkered beam
+                    p.color = U.withA(if (k % 2 == 0) 0xFFEEEEEE.toInt() else 0xFF212121.toInt(), alpha)
+                    c.drawRect(RectF(x - s + k * cw2, y - ph, x - s + (k + 1) * cw2, y - ph + bh), p)
+                }
+                p.color = U.withA(theme.accent, alpha)
+                c.drawRect(RectF(x - s * 0.6f, y - ph + bh * 1.2f, x + s * 0.6f, y - ph + bh * 2.1f), p)
+                p.color = U.withA(0xFFFFFFFF.toInt(), alpha)
+                p.textSize = s * 0.10f
+                p.typeface = font
+                p.textAlign = Paint.Align.CENTER
+                c.drawText("APEX RUSH", x, y - ph + bh * 1.8f, p)
+            }
+            8 -> { // chevron corner board
+                val bw2 = s * 0.9f
+                val bh2 = s * 0.5f
+                val cy0 = y - s * 1.0f
+                p.color = U.withA(0xFF0A0A0C.toInt(), alpha)
+                c.drawRoundRect(RectF(x - bw2, cy0 - bh2, x + bw2, cy0 + bh2), s * 0.07f, s * 0.07f, p)
+                p.color = U.withA(0xFFFFC107.toInt(), alpha)
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = s * 0.13f
+                p.strokeCap = Paint.Cap.ROUND
+                val dir = if (offsetSign < 0f) 1f else -1f
+                for (k in 0 until 3) {
+                    val ax = x - bw2 * 0.55f + k * bw2 * 0.55f
+                    path.reset()
+                    path.moveTo(ax - dir * s * 0.16f, cy0 - bh2 * 0.5f)
+                    path.lineTo(ax + dir * s * 0.16f, cy0)
+                    path.lineTo(ax - dir * s * 0.16f, cy0 + bh2 * 0.5f)
+                    c.drawPath(path, p)
+                }
+                p.style = Paint.Style.FILL
             }
             else -> { // pine
                 p.color = U.withA(0xFF5D4037.toInt(), alpha)
@@ -1419,7 +1644,50 @@ class GameView(context: Context) : View(context) {
         // pause
         val pad = w * 0.025f
         button(c, "pause", RectF(w - pad - w * 0.06f, pad, w - pad, pad + w * 0.06f), "II")
+        drawMinimap(c, tr)
         drawTouchControls(c)
+    }
+
+    // live circuit map — the real track geometry with player + rival dots
+    private fun drawMinimap(c: Canvas, tr: Track) {
+        if (mmTrack !== tr) {
+            mmTrack = tr
+            mmPath.reset()
+            for (i in 0 until tr.segments.size step 4) {
+                if (i == 0) mmPath.moveTo(tr.mapX[i], tr.mapY[i]) else mmPath.lineTo(tr.mapX[i], tr.mapY[i])
+            }
+            mmPath.lineTo(tr.mapX[0], tr.mapY[0])
+        }
+        val ms = min(w * 0.14f, h * 0.24f)
+        val mx = w - w * 0.025f - ms
+        val my = w * 0.09f
+        paint.reset()
+        paint.isAntiAlias = true
+        paint.color = U.withA(0xFF05070C.toInt(), 120)
+        c.drawRoundRect(RectF(mx - ms * 0.05f, my - ms * 0.05f, mx + ms + ms * 0.05f, my + ms + ms * 0.05f), 10f, 10f, paint)
+        c.save()
+        c.translate(mx + ms * 0.10f, my + ms * 0.10f)
+        c.scale(ms * 0.80f, ms * 0.80f)
+        paint.style = Paint.Style.STROKE
+        paint.strokeCap = Paint.Cap.ROUND
+        paint.strokeWidth = 0.052f
+        paint.color = U.withA(0xFF37474F.toInt(), 255)
+        c.drawPath(mmPath, paint)
+        paint.strokeWidth = 0.026f
+        paint.color = U.withA(0xFFCFD8DC.toInt(), 225)
+        c.drawPath(mmPath, paint)
+        paint.style = Paint.Style.FILL
+        paint.color = 0xFFFFD54F.toInt()   // start / finish
+        c.drawCircle(tr.mapX[0], tr.mapY[0], 0.028f, paint)
+        paint.color = U.withA(0xFF64B5F6.toInt(), 230)   // rivals
+        for (npc in npcs) {
+            val ni = U.mod((npc.z / SEG_LEN).toInt(), tr.segments.size)
+            c.drawCircle(tr.mapX[ni], tr.mapY[ni], 0.024f, paint)
+        }
+        paint.color = 0xFFFF6D00.toInt()   // player
+        val pi = U.mod(((playerPos + PLAYER_Z) / SEG_LEN).toInt(), tr.segments.size)
+        c.drawCircle(tr.mapX[pi], tr.mapY[pi], 0.036f, paint)
+        c.restore()
     }
 
     private fun drawTouchControls(c: Canvas) {
@@ -1560,64 +1828,72 @@ class GameView(context: Context) : View(context) {
     // ================= track select =================
 
     private fun drawTrackSelect(c: Canvas) {
-        text(c, "SELECT TRACK", w / 2f, h * 0.06f, w * 0.05f, 0xFFFFFFFF.toInt())
-        drawCoins(c, w - w * 0.02f - w * 0.16f, h * 0.025f, w * 0.16f)
-        val cardW = w * 0.28f
-        val cardH = h * 0.46f
-        for (i in 0 until 3) {
-            val left = w * 0.05f + i * (cardW + w * 0.03f)
-            val top = h * 0.13f
+        text(c, "SELECT TRACK", w / 2f, h * 0.05f, w * 0.042f, 0xFFFFFFFF.toInt())
+        drawCoins(c, w - w * 0.02f - w * 0.16f, h * 0.02f, w * 0.16f)
+        val cols = 3
+        val cardW = w * 0.293f
+        val cardH = h * 0.36f
+        for (i in 0 until THEMES.size) {
+            val row = i / cols
+            val col = i % cols
+            val left = w * 0.03f + col * (cardW + w * 0.015f)
+            val top = h * 0.085f + row * (cardH + h * 0.02f)
             val sel = save.track == i
             val th = THEMES[i]
+            val tr = trackFor(i)
             paint.reset(); paint.isAntiAlias = true
-            paint.shader = LinearGradient(left, top, left, top + cardH * 0.5f, th.skyTop, th.skyBot, Shader.TileMode.CLAMP)
-            c.drawRoundRect(RectF(left, top, left + cardW, top + cardH), 14f, 14f, paint)
+            paint.shader = LinearGradient(left, top, left, top + cardH, th.skyTop, th.skyBot, Shader.TileMode.CLAMP)
+            c.drawRoundRect(RectF(left, top, left + cardW, top + cardH), 12f, 12f, paint)
             paint.shader = null
-            paint.color = U.withA(th.sunColor, 220)
-            c.drawCircle(left + cardW * 0.7f, top + cardH * 0.22f, cardW * 0.08f, paint)
-            paint.color = th.mtNear
-            path.reset()
-            path.moveTo(left, top + cardH * 0.5f)
-            path.lineTo(left + cardW * 0.2f, top + cardH * 0.32f)
-            path.lineTo(left + cardW * 0.4f, top + cardH * 0.46f)
-            path.lineTo(left + cardW * 0.65f, top + cardH * 0.30f)
-            path.lineTo(left + cardW * 0.9f, top + cardH * 0.44f)
-            path.lineTo(left + cardW, top + cardH * 0.36f)
-            path.lineTo(left + cardW, top + cardH * 0.5f)
-            path.close()
-            c.drawPath(path, paint)
-            paint.color = th.grass1
-            c.drawRect(RectF(left, top + cardH * 0.5f, left + cardW, top + cardH * 0.62f), paint)
-            paint.color = th.road1
-            path.reset()
-            path.moveTo(left + cardW * 0.2f, top + cardH * 0.62f)
-            path.lineTo(left + cardW * 0.8f, top + cardH * 0.62f)
-            path.lineTo(left + cardW * 0.56f, top + cardH * 0.5f)
-            path.lineTo(left + cardW * 0.44f, top + cardH * 0.5f)
-            path.close()
-            c.drawPath(path, paint)
-            paint.color = U.withA(0xFF101018.toInt(), 235)
-            c.drawRoundRect(RectF(left, top + cardH * 0.62f, left + cardW, top + cardH), 14f, 14f, paint)
-            text(c, th.name, left + cardW / 2f, top + cardH * 0.70f, cardW * 0.085f, 0xFFFFFFFF.toInt())
+            // the actual circuit map, drawn from the real track geometry
+            val ms = min(cardW * 0.84f, cardH * 0.56f)
+            val cp = circuitPath(i)
+            c.save()
+            c.translate(left + (cardW - ms) / 2f, top + cardH * 0.05f)
+            c.scale(ms, ms)
+            paint.style = Paint.Style.STROKE
+            paint.strokeCap = Paint.Cap.ROUND
+            paint.strokeWidth = 0.075f
+            paint.color = U.withA(0xFF0D0D14.toInt(), 230)
+            c.drawPath(cp, paint)
+            paint.strokeWidth = 0.040f
+            paint.color = U.withA(th.accent, 255)
+            c.drawPath(cp, paint)
+            paint.style = Paint.Style.FILL
+            paint.color = 0xFFFFFFFF.toInt()
+            c.drawCircle(tr.mapX[0], tr.mapY[0], 0.045f, paint)
+            c.restore()
+            // info band
+            val bandTop = top + cardH * 0.66f
+            paint.color = U.withA(0xFF0C0D12.toInt(), 242)
+            c.drawRoundRect(RectF(left, bandTop, left + cardW, top + cardH + 12f), 12f, 12f, paint)
+            text(c, th.name, left + cardW / 2f, bandTop + cardH * 0.085f, cardW * 0.060f, 0xFFFFFFFF.toInt())
             val best = save.best[i]
             text(c, if (best > 0) "BEST " + U.fmtTime(best) else "NO RECORD",
-                left + cardW / 2f, top + cardH * 0.78f, cardW * 0.065f, 0xFFFFD54F.toInt())
-            for (d in 0 until 3) {
-                paint.color = if (d <= i) 0xFFFF6D00.toInt() else 0xFF555555.toInt()
-                c.drawCircle(left + cardW / 2f + (d - 1) * cardW * 0.08f, top + cardH * 0.86f, cardW * 0.022f, paint)
+                left + cardW / 2f, bandTop + cardH * 0.155f, cardW * 0.050f, 0xFFFFD54F.toInt())
+            val rating = TRACK_RATING[i]
+            val barW = cardW * 0.052f
+            val totalW = barW * 6f + barW * 0.5f * 5f
+            var bx = left + cardW / 2f - totalW / 2f
+            val by = bandTop + cardH * 0.225f
+            for (d in 0 until 6) {
+                paint.color = if (d < rating) 0xFFFF6D00.toInt() else U.withA(0xFFFFFFFF.toInt(), 45)
+                c.drawRoundRect(RectF(bx, by, bx + barW, by + cardH * 0.035f), 2f, 2f, paint)
+                bx += barW * 1.5f
             }
             if (sel) {
                 paint.style = Paint.Style.STROKE
                 paint.strokeWidth = 5f
                 paint.color = 0xFFFF6D00.toInt()
-                c.drawRoundRect(RectF(left, top, left + cardW, top + cardH), 14f, 14f, paint)
+                c.drawRoundRect(RectF(left, top, left + cardW, top + cardH), 12f, 12f, paint)
                 paint.style = Paint.Style.FILL
             }
             uiButtons.add(Triple("sel$i", RectF(left, top, left + cardW, top + cardH), true))
         }
-        val bw = w * 0.5f; val bh = h * 0.09f
-        button(c, "track_go", RectF(w / 2f - bw / 2f, h * 0.75f, w / 2f + bw / 2f, h * 0.75f + bh), "START RACE", accent = true)
-        button(c, "menu_back", RectF(w / 2f - bw / 2f, h * 0.75f + bh * 1.25f, w / 2f + bw / 2f, h * 0.75f + bh * 2.25f), "BACK")
+        val bw = w * 0.36f; val bh = h * 0.085f
+        val by = h * 0.885f
+        button(c, "menu_back", RectF(w * 0.04f, by, w * 0.04f + bw, by + bh), "BACK")
+        button(c, "track_go", RectF(w * 0.60f, by, w * 0.60f + bw, by + bh), "START RACE", accent = true)
     }
 
     // ================= garage =================

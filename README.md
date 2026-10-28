@@ -7,13 +7,19 @@ progress. **No assets, no external dependencies** — every graphic is drawn pro
 
 ## Features
 
-- 🖥️ **Pseudo-3D renderer** — curves, hills, roadside objects, day/sunset/night sky themes
-- 🚗 **Garage & deep customization** — chassis, paint, rims, decals, spoiler, tint, and more
-- ⬆️ **Upgrade system** — engine, handling, nitro; performance changes how the car drives
-- 🏎️ **3 themed tracks** with AI opponents
+- 🖥️ **Pseudo-3D renderer** — curves, hills, fog, glowing night edge markers, 280-segment draw distance
+- 🗺️ **Real circuit maps** — every track's minimap is computed from its actual curvature geometry
+  (integrated into a driven 2D path), shown in track select and as a live in-race minimap with
+  player + rival dots
+- 🏁 **6 tracks** — Sunset Coast, Neon City, Alpine Pass, Desert Heat, Emerald Forest, Midnight Storm —
+  each with its own theme, layout, scenery and difficulty rating
+- 🌧️ **Weather** — rain on forest/storm tracks, lightning flashes on Midnight Storm, snowfall on Alpine Pass
+- 🚧 **3D track furniture** — overhead start/finish gantries you drive under, chevron corner boards on
+  sharp bends, palms, pines, cacti, buildings, streetlights, billboards
+- 🚗 **Garage & deep customization** — 3 chassis, 16 paints, 4 finishes, 5 rim styles, spoilers, stripes, neon glow
+- ⬆️ **Upgrade system** — engine, turbo, tires; performance changes how the car drives
 - 💨 **Drift & nitro mechanics** with a points system
-- 💾 **Saved progress** — money, upgrades, and customization stored locally (JSON)
-- 📦 **Zero dependencies** — builds offline against the platform SDK alone
+- 💾 **Saved progress** — money, upgrades, customization and per-track best times stored locally
 
 ## Build
 
@@ -41,7 +47,7 @@ gradle wrapper --gradle-version 8.7   # once
 | Touch | Action |
 | --- | --- |
 | Left / right half of screen | Steer |
-| Bottom-right button | Accelerate |
+| Bottom-right button | Brake |
 | Nitro button | Boost (consumes nitro) |
 | Menu buttons | Garage, upgrades, track select |
 
