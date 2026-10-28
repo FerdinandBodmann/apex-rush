@@ -15,13 +15,25 @@ import android.os.Bundle
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.opengl.GLES20
+import android.opengl.GLSurfaceView
+import android.opengl.Matrix
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import javax.microedition.khronos.egl.EGLConfig
+import javax.microedition.khronos.opengles.GL10
 import org.json.JSONObject
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.min
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 // ============================================================
 //  APEX RUSH - arcade car racing for Android
@@ -32,15 +44,44 @@ import kotlin.math.sin
 // ============================================================
 
 class MainActivity : Activity() {
+    private var glView: GLSurfaceView? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        setContentView(GameView(this))
+        val game = GameView(this)
+        // real 3D race renderer underneath, 2D UI / HUD overlay on top
+        val gl = GLSurfaceView(this)
+        gl.setEGLContextClientVersion(2)
+        gl.setEGLConfigChooser(8, 8, 8, 0, 24, 0)
+        gl.setRenderer(RaceRenderer(game))
+        gl.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        glView = gl
+        val root = FrameLayout(this)
+        root.addView(
+            gl,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        )
+        root.addView(
+            game,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        )
+        setContentView(root)
         @Suppress("DEPRECATION")
         window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 or View.SYSTEM_UI_FLAG_FULLSCREEN
                 or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                 or View.SYSTEM_UI_FLAG_LAYOUT_STABLE)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        glView?.onResume()
+    }
+
+    override fun onPause() {
+        glView?.onPause()
+        super.onPause()
     }
 }
 
@@ -286,36 +327,54 @@ class Track(val themeIdx: Int, val segments: Array<Seg>) {
     val length = segments.size * SEG_LEN
     val theme: Theme get() = THEMES[themeIdx]
 
-    // Real 2D map of the circuit: the per-segment curvature is integrated
-    // into a driven path (heading += curve * k), then normalized to 0..1.
-    // This is the actual track geometry used for minimaps — not a picture.
+    // Real 2D map of the circuit (normalized 0..1) — used by minimaps.
     val mapX = FloatArray(segments.size)
     val mapY = FloatArray(segments.size)
 
+    // True 3D centerline in world space: the per-segment curvature is
+    // integrated into a driven path (XZ plane), with real elevation (Y).
+    // The GL renderer builds the road mesh from this.
+    val worldX = FloatArray(segments.size)
+    val worldY = FloatArray(segments.size)
+    val worldZ = FloatArray(segments.size)
+
     init {
+        val n = segments.size
         val k = 0.03f
         var hx = 0f
         var hy = 0f
         var heading = 0f
-        var minX = 0f; var maxX = 0f
-        var minY = 0f; var maxY = 0f
-        for (i in segments.indices) {
-            mapX[i] = hx
-            mapY[i] = hy
+        val rawX = FloatArray(n)
+        val rawZ = FloatArray(n)
+        for (i in 0 until n) {
+            rawX[i] = hx
+            rawZ[i] = hy
+            worldY[i] = segments[i].p1.world.y * 0.24f
             hx += cos(heading)
             hy += sin(heading)
             heading += segments[i].curve * k
-            if (hx < minX) minX = hx
-            if (hx > maxX) maxX = hx
-            if (hy < minY) minY = hy
-            if (hy > maxY) maxY = hy
+        }
+        // close the loop seamlessly: shear the circuit by the end-to-start gap
+        val gx = (rawX[0] - hx) / n
+        val gz = (rawZ[0] - hy) / n
+        var minX = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var minZ = Float.MAX_VALUE
+        var maxZ = -Float.MAX_VALUE
+        for (i in 0 until n) {
+            worldX[i] = (rawX[i] + gx * i) * SEG_LEN
+            worldZ[i] = (rawZ[i] + gz * i) * SEG_LEN
+            if (worldX[i] < minX) minX = worldX[i]
+            if (worldX[i] > maxX) maxX = worldX[i]
+            if (worldZ[i] < minZ) minZ = worldZ[i]
+            if (worldZ[i] > maxZ) maxZ = worldZ[i]
         }
         val cx = (minX + maxX) * 0.5f
-        val cy = (minY + maxY) * 0.5f
-        val s = 1f / maxOf(maxX - minX, maxY - minY, 1f)
-        for (i in segments.indices) {
-            mapX[i] = 0.5f + (mapX[i] - cx) * s
-            mapY[i] = 0.5f + (mapY[i] - cy) * s
+        val cz = (minZ + maxZ) * 0.5f
+        val s = 1f / maxOf(maxX - minX, maxZ - minZ, 1f)
+        for (i in 0 until n) {
+            mapX[i] = 0.5f + (worldX[i] - cx) * s
+            mapY[i] = 0.5f + (worldZ[i] - cz) * s
         }
     }
 }
@@ -692,6 +751,786 @@ class Npc(val spec: CarSpec, var z: Float, var offset: Float, var base: Float) {
     var targetOffset = offset
 }
 
+// ------------------------- OpenGL ES 3D engine -------------------------
+
+// True 3D engine for the race: the track becomes a real mesh in world
+// space (circuit centerline + elevation), rendered with GLSL shaders
+// (procedural road texture, per-fragment fog, Blinn-Phong lighting,
+// specular paint, procedural sky with sun glare, clouds and stars).
+// The 2D GameView keeps drawing menus, HUD and weather on top.
+
+private val SKY_VS = """
+attribute vec2 aPos;
+varying vec2 vUV;
+void main() {
+    vUV = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.9999, 1.0);
+}
+"""
+
+private val SKY_FS = """
+precision highp float;
+varying vec2 vUV;
+uniform vec3 uTop;
+uniform vec3 uBot;
+uniform vec2 uSun;
+uniform vec3 uSunCol;
+uniform float uNight;
+uniform float uTime;
+uniform float uOff;
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+void main() {
+    vec3 col = mix(uBot, uTop, clamp(vUV.y, 0.0, 1.0));
+    vec2 d = vUV - uSun;
+    d.y *= 1.35;
+    float dist = length(d);
+    col += uSunCol * (exp(-dist * 10.0) + 0.30 * exp(-dist * 2.2));
+    if (uNight > 0.5) {
+        vec2 g = floor(vUV * vec2(260.0, 150.0));
+        float st = step(0.9968, hash(g));
+        float tw = 0.55 + 0.45 * sin(uTime * 2.0 + hash(g + 7.3) * 40.0);
+        col += vec3(0.9, 0.95, 1.0) * st * tw;
+    } else {
+        vec2 cp = vec2(vUV.x * 3.0 + uOff, vUV.y * 7.0);
+        float nn = noise(cp + vec2(uTime * 0.012, 0.0)) * 0.55
+                 + noise(cp * 2.7 + vec2(uTime * 0.02, 3.0)) * 0.30;
+        float cl = smoothstep(0.52, 0.85, nn) * smoothstep(0.0, 0.30, vUV.y);
+        col = mix(col, vec3(0.98), cl * 0.55);
+    }
+    gl_FragColor = vec4(col, 1.0);
+}
+"""
+
+private val TERR_VS = """
+attribute vec3 aPos;
+attribute vec3 aNrm;
+attribute vec2 aLA;
+uniform mat4 uVP;
+uniform vec3 uCam;
+varying vec2 vLA;
+varying vec3 vNrm;
+varying float vDist;
+void main() {
+    vLA = aLA;
+    vNrm = aNrm;
+    vDist = distance(aPos, uCam);
+    gl_Position = uVP * vec4(aPos, 1.0);
+}
+"""
+
+private val TERR_FS = """
+precision highp float;
+varying vec2 vLA;
+varying vec3 vNrm;
+varying float vDist;
+uniform vec3 uSun;
+uniform vec3 uRoadA;
+uniform vec3 uRoadB;
+uniform vec3 uGrassA;
+uniform vec3 uGrassB;
+uniform vec3 uRumA;
+uniform vec3 uRumB;
+uniform vec3 uLane;
+uniform vec3 uFog;
+uniform float uFogD;
+uniform float uNight;
+uniform vec3 uAccent;
+void main() {
+    float a = abs(vLA.x);
+    float stripe = step(0.5, mod(floor(vLA.y / 600.0), 2.0));
+    vec3 col;
+    if (a <= 1.0) {
+        col = mix(uRoadA, uRoadB, stripe);
+        float r = step(0.92, a);
+        col = mix(col, mix(uRumA, uRumB, stripe), r);
+        float ln = 1.0 - smoothstep(0.016, 0.05, abs(abs(vLA.x) - 0.3333));
+        float dash = step(mod(vLA.y, 1000.0), 640.0);
+        col = mix(col, uLane, ln * dash * (1.0 - r));
+        if (vLA.y < 420.0) {
+            float ck = mod(floor(vLA.y / 100.0) + floor(vLA.x + 10.0), 2.0);
+            col = mix(vec3(0.92), vec3(0.08), ck);
+        }
+        col *= 0.93 + 0.07 * sin(vLA.y * 0.31) * sin(vLA.x * 17.0);
+        if (uNight > 0.5) {
+            float g = (1.0 - smoothstep(0.985, 1.0, a)) * step(0.92, a);
+            col = mix(col, uAccent * 1.7, g);
+        }
+    } else {
+        col = mix(uGrassA, uGrassB, stripe);
+        col *= 0.80 + 0.20 * sin(vLA.y * 0.13 + vLA.x * 2.7);
+        if (uNight > 0.5) col *= 0.55;
+    }
+    float light = 0.72 + 0.35 * max(dot(normalize(vNrm), uSun), 0.0);
+    col *= light;
+    float fog = 1.0 - exp(-vDist * uFogD);
+    col = mix(col, uFog, fog);
+    gl_FragColor = vec4(col, 1.0);
+}
+"""
+
+private val OBJ_VS = """
+attribute vec3 aPos;
+attribute vec3 aNrm;
+uniform mat4 uVP;
+uniform mat4 uModel;
+uniform vec3 uCam;
+varying vec3 vNrm;
+varying float vDist;
+varying vec3 vWorld;
+void main() {
+    vec4 wp = uModel * vec4(aPos, 1.0);
+    vWorld = wp.xyz;
+    mat3 nm = mat3(uModel[0].xyz, uModel[1].xyz, uModel[2].xyz);
+    vNrm = nm * aNrm;
+    vDist = distance(wp.xyz, uCam);
+    gl_Position = uVP * wp;
+}
+"""
+
+private val OBJ_FS = """
+precision highp float;
+varying vec3 vNrm;
+varying float vDist;
+varying vec3 vWorld;
+uniform vec3 uColor;
+uniform vec3 uSun;
+uniform vec3 uCam;
+uniform vec3 uFog;
+uniform float uFogD;
+uniform float uSpec;
+uniform float uEmis;
+void main() {
+    vec3 n = normalize(vNrm);
+    float diff = max(dot(n, uSun), 0.0);
+    vec3 v = normalize(uCam - vWorld);
+    vec3 h = normalize(uSun + v);
+    float sp = pow(max(dot(n, h), 0.0), 42.0) * uSpec;
+    float fr = pow(1.0 - max(dot(n, v), 0.0), 4.0) * uSpec * 0.5;
+    vec3 col = uColor * (0.30 + 0.80 * diff) + vec3(sp + fr);
+    col += uColor * uEmis;
+    float fog = 1.0 - exp(-vDist * uFogD);
+    col = mix(col, uFog, fog);
+    gl_FragColor = vec4(col, 1.0);
+}
+"""
+
+object GLUtil {
+    fun compile(type: Int, src: String): Int {
+        val sh = GLES20.glCreateShader(type)
+        if (sh == 0) return 0
+        GLES20.glShaderSource(sh, src)
+        GLES20.glCompileShader(sh)
+        val ok = IntArray(1)
+        GLES20.glGetShaderiv(sh, GLES20.GL_COMPILE_STATUS, ok, 0)
+        if (ok[0] == 0) {
+            android.util.Log.e("ApexRushGL", "shader: " + GLES20.glGetShaderInfoLog(sh))
+            GLES20.glDeleteShader(sh)
+            return 0
+        }
+        return sh
+    }
+
+    fun program(vs: String, fs: String): Int {
+        val p = GLES20.glCreateProgram()
+        val v = compile(GLES20.GL_VERTEX_SHADER, vs)
+        val f = compile(GLES20.GL_FRAGMENT_SHADER, fs)
+        if (p == 0 || v == 0 || f == 0) return 0
+        GLES20.glAttachShader(p, v)
+        GLES20.glAttachShader(p, f)
+        GLES20.glLinkProgram(p)
+        val ok = IntArray(1)
+        GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0)
+        if (ok[0] == 0) android.util.Log.e("ApexRushGL", "link: " + GLES20.glGetProgramInfoLog(p))
+        GLES20.glDeleteShader(v)
+        GLES20.glDeleteShader(f)
+        return p
+    }
+
+    fun buf(data: FloatArray): Int {
+        val b = IntArray(1)
+        GLES20.glGenBuffers(1, b, 0)
+        val fb = ByteBuffer.allocateDirect(data.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+        fb.put(data).position(0)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, b[0])
+        GLES20.glBufferData(GLES20.GL_ARRAY_BUFFER, data.size * 4, fb, GLES20.GL_STATIC_DRAW)
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+        return b[0]
+    }
+
+    fun rgb(c: Int, out: FloatArray) {
+        out[0] = (c shr 16 and 0xFF) / 255f
+        out[1] = (c shr 8 and 0xFF) / 255f
+        out[2] = (c and 0xFF) / 255f
+    }
+}
+
+class Prog(vs: String, fs: String) {
+    val id = GLUtil.program(vs, fs)
+    private val attribs = HashMap<String, Int>()
+    private val unis = HashMap<String, Int>()
+    fun a(name: String): Int = attribs.getOrPut(name) { GLES20.glGetAttribLocation(id, name) }
+    fun u(name: String): Int = unis.getOrPut(name) { GLES20.glGetUniformLocation(id, name) }
+}
+
+class Mesh {
+    var vbo = 0
+    var count = 0
+    private var strideF = 0
+    fun upload(data: FloatArray, stride: Int) {
+        vbo = GLUtil.buf(data)
+        count = data.size / stride
+        strideF = stride
+    }
+    fun draw(p: Prog, layout: Array<String>) {
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, vbo)
+        var off = 0
+        val locs = IntArray(layout.size)
+        for (i in layout.indices) {
+            val spec = layout[i]
+            val colon = spec.indexOf(':')
+            val name = spec.substring(0, colon)
+            val size = spec.substring(colon + 1).toInt()
+            locs[i] = p.a(name)
+            if (locs[i] >= 0) {
+                GLES20.glEnableVertexAttribArray(locs[i])
+                GLES20.glVertexAttribPointer(locs[i], size, GLES20.GL_FLOAT, false, strideF * 4, off * 4)
+            }
+            off += size
+        }
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, count)
+        for (i in layout.indices) if (locs[i] >= 0) GLES20.glDisableVertexAttribArray(locs[i])
+        GLES20.glBindBuffer(GLES20.GL_ARRAY_BUFFER, 0)
+    }
+}
+
+object Meshes {
+
+    // emits a triangle with computed flat normal (pos3 + nrm3 = 6 floats/vertex)
+    fun emitTri(d: FloatArray, at: Int, ax: Float, ay: Float, az: Float,
+                bx: Float, by: Float, bz: Float,
+                cx: Float, cy: Float, cz: Float): Int {
+        val ux = bx - ax
+        val uy = by - ay
+        val uz = bz - az
+        val vx = cx - ax
+        val vy = cy - ay
+        val vz = cz - az
+        var nx = uy * vz - uz * vy
+        var ny = uz * vx - ux * vz
+        var nz = ux * vy - uy * vx
+        val nl = sqrt(nx * nx + ny * ny + nz * nz)
+        if (nl > 0f) {
+            nx /= nl; ny /= nl; nz /= nl
+        }
+        var i = at
+        d[i++] = ax; d[i++] = ay; d[i++] = az; d[i++] = nx; d[i++] = ny; d[i++] = nz
+        d[i++] = bx; d[i++] = by; d[i++] = bz; d[i++] = nx; d[i++] = ny; d[i++] = nz
+        d[i++] = cx; d[i++] = cy; d[i++] = cz; d[i++] = nx; d[i++] = ny; d[i++] = nz
+        return i
+    }
+
+    fun boxData(): FloatArray {
+        val d = FloatArray(12 * 18)
+        var i = 0
+        // +z
+        i = emitTri(d, i, -1f, -1f, 1f, 1f, -1f, 1f, 1f, 1f, 1f)
+        i = emitTri(d, i, -1f, -1f, 1f, 1f, 1f, 1f, -1f, 1f, 1f)
+        // -z
+        i = emitTri(d, i, 1f, -1f, -1f, -1f, -1f, -1f, -1f, 1f, -1f)
+        i = emitTri(d, i, 1f, -1f, -1f, -1f, 1f, -1f, 1f, 1f, -1f)
+        // +y
+        i = emitTri(d, i, -1f, 1f, -1f, 1f, 1f, 1f, 1f, 1f, -1f)
+        i = emitTri(d, i, -1f, 1f, -1f, 1f, 1f, 1f, -1f, 1f, 1f)
+        // -y
+        i = emitTri(d, i, -1f, -1f, -1f, 1f, -1f, 1f, 1f, -1f, 1f)
+        i = emitTri(d, i, -1f, -1f, -1f, 1f, -1f, 1f, -1f, -1f, 1f)
+        // +x
+        i = emitTri(d, i, 1f, -1f, 1f, 1f, -1f, -1f, 1f, 1f, -1f)
+        i = emitTri(d, i, 1f, -1f, 1f, 1f, 1f, -1f, 1f, 1f, 1f)
+        // -x
+        i = emitTri(d, i, -1f, -1f, -1f, -1f, -1f, 1f, -1f, 1f, 1f)
+        i = emitTri(d, i, -1f, -1f, -1f, -1f, 1f, 1f, -1f, 1f, -1f)
+        return d
+    }
+
+    fun quadData(): FloatArray {
+        val d = FloatArray(2 * 18)
+        var i = emitTri(d, 0, -1f, -1f, 0f, 1f, -1f, 0f, 1f, 1f, 0f)
+        i = emitTri(d, i, -1f, -1f, 0f, 1f, 1f, 0f, -1f, 1f, 0f)
+        return d
+    }
+
+    fun coneData(): FloatArray {
+        val n = 10
+        val d = FloatArray(n * 18)
+        var at = 0
+        for (k in 0 until n) {
+            val a1 = k * 6.2831855f / n
+            val a2 = (k + 1) * 6.2831855f / n
+            val x1 = cos(a1); val z1 = sin(a1)
+            val x2 = cos(a2); val z2 = sin(a2)
+            at = emitTri(d, at, x2, 0f, z2, x1, 0f, z1, 0f, 1f, 0f)
+        }
+        return d
+    }
+
+    fun wheelData(): FloatArray {
+        val n = 10
+        val r = 0.5f
+        val d = FloatArray(n * 4 * 18)
+        var at = 0
+        val ys = FloatArray(n)
+        val zs = FloatArray(n)
+        for (k in 0 until n) {
+            val a = k * 6.2831855f / n
+            ys[k] = cos(a) * r
+            zs[k] = sin(a) * r
+        }
+        for (k in 0 until n) {
+            val k2 = (k + 1) % n
+            // side (outward)
+            at = emitTri(d, at, 0.5f, ys[k], zs[k], -0.5f, ys[k], zs[k], -0.5f, ys[k2], zs[k2])
+            at = emitTri(d, at, 0.5f, ys[k], zs[k], -0.5f, ys[k2], zs[k2], 0.5f, ys[k2], zs[k2])
+            // caps
+            at = emitTri(d, at, 0.5f, 0f, 0f, ys[k], zs[k], 0.5f, ys[k2], zs[k2])
+            at = emitTri(d, at, -0.5f, 0f, 0f, ys[k2], zs[k2], -0.5f, ys[k], zs[k])
+        }
+        return d
+    }
+
+    // beveled box: tapered silhouette used for car body / cabin
+    fun taperBoxData(bx: Float, bz: Float, yBase: Float, h: Float, taper: Float, zOff: Float): FloatArray {
+        val tx = bx * taper
+        val tz = bz * taper
+        val yt = yBase + h
+        val d = FloatArray(10 * 18)
+        var i = 0
+        // top (+y)
+        i = emitTri(d, i, -tx, yt, -tz + zOff, tx, yt, tz + zOff, tx, yt, -tz + zOff)
+        i = emitTri(d, i, -tx, yt, -tz + zOff, -tx, yt, tz + zOff, tx, yt, tz + zOff)
+        // front (+z)
+        i = emitTri(d, i, -bx, yBase, bz + zOff, bx, yBase, bz + zOff, tx, yt, tz + zOff)
+        i = emitTri(d, i, -bx, yBase, bz + zOff, tx, yt, tz + zOff, -tx, yt, tz + zOff)
+        // rear (-z)
+        i = emitTri(d, i, bx, yBase, -bz + zOff, -bx, yBase, -bz + zOff, -tx, yt, -tz + zOff)
+        i = emitTri(d, i, bx, yBase, -bz + zOff, -tx, yt, -tz + zOff, tx, yt, -tz + zOff)
+        // right (+x)
+        i = emitTri(d, i, bx, yBase, bz + zOff, bx, yBase, -bz + zOff, tx, yt, -tz + zOff)
+        i = emitTri(d, i, bx, yBase, bz + zOff, tx, yt, -tz + zOff, tx, yt, tz + zOff)
+        // left (-x)
+        i = emitTri(d, i, -bx, yBase, -bz + zOff, -bx, yBase, bz + zOff, -tx, yt, tz + zOff)
+        i = emitTri(d, i, -bx, yBase, -bz + zOff, -tx, yt, tz + zOff, -tx, yt, -tz + zOff)
+        return d
+    }
+}
+
+internal class RaceRenderer internal constructor(private val game: GameView) : GLSurfaceView.Renderer {
+
+    private class ScenInst(val type: Int, val x: Float, val y: Float, val z: Float, val yaw: Float, val s: Float)
+
+    private val proj = FloatArray(16)
+    private val view = FloatArray(16)
+    private val vp = FloatArray(16)
+    private val modelM = FloatArray(16)
+    private val tmp4 = FloatArray(4)
+    private val sunPt = FloatArray(4)
+    private var aspect = 1f
+
+    private var progSky: Prog? = null
+    private var progTerr: Prog? = null
+    private var progObj: Prog? = null
+    private val skyQuad = Mesh()
+    private val terrain = Mesh()
+    private val cone = Mesh()
+    private val box = Mesh()
+    private val quad = Mesh()
+    private val wheel = Mesh()
+    private val carBody = Mesh()
+    private val carCabin = Mesh()
+
+    private var builtTrack: Track? = null
+    private val scenery = ArrayList<ScenInst>()
+
+    private val cA = FloatArray(3)
+    private val cB = FloatArray(3)
+    private val cC = FloatArray(3)
+    private val cen = FloatArray(6)   // centerline sample: x,y,z,dx,dz
+    private val carScale = 160f       // world units per car unit
+
+    override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        progSky = Prog(SKY_VS, SKY_FS)
+        progTerr = Prog(TERR_VS, TERR_FS)
+        progObj = Prog(OBJ_VS, OBJ_FS)
+        skyQuad.upload(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, -1f, 1f, 1f, -1f, 1f, 1f), 2)
+        cone.upload(Meshes.coneData(), 6)
+        box.upload(Meshes.boxData(), 6)
+        quad.upload(Meshes.quadData(), 6)
+        wheel.upload(Meshes.wheelData(), 6)
+        carBody.upload(Meshes.taperBoxData(1.0f, 2.2f, 0.22f, 0.62f, 0.86f, 0f), 6)
+        carCabin.upload(Meshes.taperBoxData(0.78f, 1.35f, 0.84f, 0.42f, 0.62f, -0.35f), 6)
+        GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+    }
+
+    override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        GLES20.glViewport(0, 0, width, height)
+        aspect = width.toFloat() / maxOf(height, 1)
+        Matrix.perspectiveM(proj, 0, 58f, aspect, 120f, 90000f)
+    }
+
+    override fun onDrawFrame(gl: GL10?) {
+        val tr = game.raceTrack()
+        val fogC = if (tr != null) tr.theme.fog else 0xFF0A0A12.toInt()
+        GLUtil.rgb(fogC, cA)
+        GLES20.glClearColor(cA[0], cA[1], cA[2], 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        if (tr == null) return
+
+        if (builtTrack !== tr) buildTrackGeometry(tr)
+        val theme = tr.theme
+
+        // ---- camera: chase view behind the player ----
+        center(tr, game.playerPos - 700f, cen)
+        val ex = cen[0]; val ey = cen[1]; val ez = cen[2]
+        center(tr, game.playerPos + 1500f, cen)
+        val tx = cen[0]; val ty = cen[1]; val tz = cen[2]
+        val headYaw = atan2(tx - ex, tz - ez)
+        // lateral shift follows the player's road position
+        val ldx = -cos(headYaw)
+        val ldz = sin(headYaw)
+        val lat = game.playerX * ROAD_W
+        val eyeX = ex + ldx * lat * 0.55f
+        val eyeZ = ez + ldz * lat * 0.55f
+        val eyeY = ey + CAM_H * 1.35f
+        val tX = tx + ldx * lat
+        val tZ = tz + ldz * lat
+        val tY = ty + CAM_H * 0.75f
+        Matrix.setLookAtM(view, 0, eyeX, eyeY, eyeZ, tX, tY, tZ, 0f, 1f, 0f)
+        Matrix.multiplyMM(vp, 0, proj, 0, view, 0)
+
+        // ---- sun ----
+        val azim = theme.sunX * 6.2831855f
+        val elev = (1f - theme.sunY * 2f) * 0.75f + 0.15f
+        val sunI = if (theme.night) 0.18f else 1f
+        var sx = cos(azim) * cos(elev)
+        var sy = sin(elev)
+        var sz = sin(azim) * cos(elev)
+        val sl = sqrt(sx * sx + sy * sy + sz * sz)
+        sx /= sl; sy /= sl; sz /= sl
+
+        // ---- sky ----
+        val ps = progSky!!
+        GLES20.glUseProgram(ps.id)
+        GLES20.glDepthMask(false)
+        GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+        sunPt[0] = eyeX + sx * 40000f
+        sunPt[1] = eyeY + sy * 40000f
+        sunPt[2] = eyeZ + sz * 40000f
+        sunPt[3] = 1f
+        Matrix.multiplyMV(tmp4, 0, vp, 0, sunPt, 0)
+        var sunU = -5f
+        var sunV = -5f
+        if (tmp4[3] > 0f) {
+            sunU = (tmp4[0] / tmp4[3] + 1f) * 0.5f
+            sunV = (1f - (tmp4[1] / tmp4[3] + 1f) * 0.5f)
+        }
+        GLUtil.rgb(theme.skyTop, cA)
+        GLES20.glUniform3f(ps.u("uTop"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.skyBot, cB)
+        GLES20.glUniform3f(ps.u("uBot"), cB[0], cB[1], cB[2])
+        GLES20.glUniform2f(ps.u("uSun"), sunU, sunV)
+        GLUtil.rgb(theme.sunColor, cC)
+        GLES20.glUniform3f(ps.u("uSunCol"), cC[0] * sunI, cC[1] * sunI, cC[2] * sunI)
+        GLES20.glUniform1f(ps.u("uNight"), if (theme.night) 1f else 0f)
+        GLES20.glUniform1f(ps.u("uTime"), game.time)
+        GLES20.glUniform1f(ps.u("uOff"), headYaw * 0.2f + game.time * 0.002f)
+        skyQuad.draw(ps, arrayOf("aPos:2"))
+        GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+        GLES20.glDepthMask(true)
+
+        // ---- terrain ----
+        val pt = progTerr!!
+        GLES20.glUseProgram(pt.id)
+        GLES20.glUniformMatrix4fv(pt.u("uVP"), 1, false, vp, 0)
+        GLES20.glUniform3f(pt.u("uCam"), eyeX, eyeY, eyeZ)
+        GLES20.glUniform3f(pt.u("uSun"), sx * sunI, sy * sunI, sz * sunI)
+        GLUtil.rgb(theme.road1, cA)
+        GLES20.glUniform3f(pt.u("uRoadA"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.road2, cA)
+        GLES20.glUniform3f(pt.u("uRoadB"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.grass1, cA)
+        GLES20.glUniform3f(pt.u("uGrassA"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.grass2, cA)
+        GLES20.glUniform3f(pt.u("uGrassB"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.rumble1, cA)
+        GLES20.glUniform3f(pt.u("uRumA"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.rumble2, cA)
+        GLES20.glUniform3f(pt.u("uRumB"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.lane, cA)
+        GLES20.glUniform3f(pt.u("uLane"), cA[0], cA[1], cA[2])
+        GLUtil.rgb(theme.fog, cA)
+        GLES20.glUniform3f(pt.u("uFog"), cA[0], cA[1], cA[2])
+        GLES20.glUniform1f(pt.u("uFogD"), 1f / 13000f)
+        GLES20.glUniform1f(pt.u("uNight"), if (theme.night) 1f else 0f)
+        GLUtil.rgb(theme.accent, cA)
+        GLES20.glUniform3f(pt.u("uAccent"), cA[0], cA[1], cA[2])
+        terrain.draw(pt, arrayOf("aPos:3", "aNrm:3", "aLA:2"))
+
+        // ---- objects ----
+        val po = progObj!!
+        GLES20.glUseProgram(po.id)
+        GLES20.glUniformMatrix4fv(po.u("uVP"), 1, false, vp, 0)
+        GLES20.glUniform3f(po.u("uCam"), eyeX, eyeY, eyeZ)
+        GLES20.glUniform3f(po.u("uSun"), sx * sunI, sy * sunI, sz * sunI)
+        GLUtil.rgb(theme.fog, cA)
+        GLES20.glUniform3f(po.u("uFog"), cA[0], cA[1], cA[2])
+        GLES20.glUniform1f(po.u("uFogD"), 1f / 13000f)
+
+        // scenery within view distance
+        for (si in scenery) {
+            val dx = si.x - eyeX
+            val dz = si.z - eyeZ
+            if (dx * dx + dz * dz > 24000f * 24000f) continue
+            drawScenery(si, theme.night)
+        }
+
+        // NPC cars
+        for (npc in game.npcs) {
+            center(tr, npc.z, cen)
+            val cy = cen[1]
+            val cyaw = atan2(cen[3], cen[4])
+            val clx = -cos(cyaw)
+            val clz = sin(cyaw)
+            drawCar(npc.spec, cen[0] + clx * npc.offset * ROAD_W, cy, cen[2] + clz * npc.offset * ROAD_W, cyaw)
+        }
+
+        // player car
+        center(tr, game.playerPos + PLAYER_Z, cen)
+        val pyaw = atan2(cen[3], cen[4])
+        val plx = -cos(pyaw)
+        val plz = sin(pyaw)
+        drawCar(game.save.spec, cen[0] + plx * lat, cen[1], cen[2] + plz * lat, pyaw)
+    }
+
+    // ---------------- geometry build ----------------
+
+    private fun buildTrackGeometry(tr: Track) {
+        builtTrack = tr
+        val n = tr.segments.size
+        val lats = floatArrayOf(-3.2f, -1f, 1f, 3.2f)
+        val data = FloatArray(n * 3 * 6 * 8)
+        var at = 0
+        for (i in 0 until n) {
+            val j = (i + 1) % n
+            val x1 = tr.worldX[i]; val z1 = tr.worldZ[i]; val y1 = tr.worldY[i]
+            val x2 = tr.worldX[j]; val z2 = tr.worldZ[j]; val y2 = tr.worldY[j]
+            var tX = x2 - x1
+            var tZ = z2 - z1
+            val tl = sqrt(tX * tX + tZ * tZ)
+            if (tl < 0.001f) continue
+            tX /= tl; tZ /= tl
+            val lX = -tZ
+            val lZ = tX
+            val along = i * SEG_LEN
+            for (q in 0 until 3) {
+                val la0 = lats[q]
+                val la1 = lats[q + 1]
+                val ax = x1 + lX * la0 * ROAD_W
+                val az = z1 + lZ * la0 * ROAD_W
+                val bx = x1 + lX * la1 * ROAD_W
+                val bz = z1 + lZ * la1 * ROAD_W
+                val cx = x2 + lX * la1 * ROAD_W
+                val cz = z2 + lZ * la1 * ROAD_W
+                val dx = x2 + lX * la0 * ROAD_W
+                val dz = z2 + lZ * la0 * ROAD_W
+                // quad normal (approx, from edges)
+                val e1x = bx - ax
+                val e1z = bz - az
+                val e2x = dx - ax
+                val e2z = dz - az
+                var nx = e1z * (y2 - y1)
+                var ny = e1z * e2x - e1x * e2z
+                var nz = -e1x * (y2 - y1)
+                val nl = sqrt(nx * nx + ny * ny + nz * nz)
+                if (nl > 0f) { nx /= nl; ny /= nl; nz /= nl }
+                // tri 1: A, B, C
+                at = emitTerr(data, at, ax, y1, az, nx, ny, nz, la0, along)
+                at = emitTerr(data, at, bx, y1, bz, nx, ny, nz, la1, along)
+                at = emitTerr(data, at, cx, y2, cz, nx, ny, nz, la1, along + SEG_LEN)
+                // tri 2: A, C, D
+                at = emitTerr(data, at, ax, y1, az, nx, ny, nz, la0, along)
+                at = emitTerr(data, at, cx, y2, cz, nx, ny, nz, la1, along + SEG_LEN)
+                at = emitTerr(data, at, dx, y2, dz, nx, ny, nz, la0, along + SEG_LEN)
+            }
+        }
+        terrain.upload(data, 8)
+
+        scenery.clear()
+        for (i in 0 until n) {
+            val seg = tr.segments[i]
+            if (seg.sprites.isEmpty()) continue
+            val x1 = tr.worldX[i]; val z1 = tr.worldZ[i]; val y1 = tr.worldY[i]
+            val j = (i + 1) % n
+            var tX = tr.worldX[j] - x1
+            var tZ = tr.worldZ[j] - z1
+            val tl = sqrt(tX * tX + tZ * tZ)
+            if (tl < 0.001f) continue
+            tX /= tl; tZ /= tl
+            val lX = -tZ
+            val lZ = tX
+            val yaw = atan2(tX, tZ)
+            for (sp in seg.sprites) {
+                scenery.add(ScenInst(sp.type, x1 + lX * sp.offset * ROAD_W, y1, z1 + lZ * sp.offset * ROAD_W, yaw, sp.scale))
+            }
+        }
+    }
+
+    private fun emitTerr(d: FloatArray, at: Int, x: Float, y: Float, z: Float,
+                         nx: Float, ny: Float, nz: Float, lat: Float, along: Float): Int {
+        var i = at
+        d[i++] = x; d[i++] = y; d[i++] = z
+        d[i++] = nx; d[i++] = ny; d[i++] = nz
+        d[i++] = lat; d[i++] = along
+        return i
+    }
+
+    // centerline sample: out = [x, y, z, dx, dz(tangent)]
+    private fun center(tr: Track, arc: Float, out: FloatArray) {
+        val n = tr.segments.size
+        val f = U.wrap(arc, tr.length) / SEG_LEN
+        val i0 = U.mod(f.toInt(), n)
+        val i1 = (i0 + 1) % n
+        val t = f - f.toInt()
+        out[0] = U.lerp(tr.worldX[i0], tr.worldX[i1], t)
+        out[1] = U.lerp(tr.worldY[i0], tr.worldY[i1], t)
+        out[2] = U.lerp(tr.worldZ[i0], tr.worldZ[i1], t)
+        out[3] = tr.worldX[i1] - tr.worldX[i0]
+        out[4] = tr.worldZ[i1] - tr.worldZ[i0]
+    }
+
+    // ---------------- object draws ----------------
+
+    private fun drawObj(mesh: Mesh, color: Int, spec: Float, emis: Float,
+                        x: Float, y: Float, z: Float, yaw: Float,
+                        sx: Float, sy: Float, sz: Float) {
+        val p = progObj!!
+        Matrix.setIdentityM(modelM, 0)
+        Matrix.translateM(modelM, 0, x, y, z)
+        Matrix.rotateM(modelM, 0, yaw * 57.29578f, 0f, 1f, 0f)
+        Matrix.scaleM(modelM, 0, sx, sy, sz)
+        GLES20.glUniformMatrix4fv(p.u("uModel"), 1, false, modelM, 0)
+        GLUtil.rgb(color, cC)
+        GLES20.glUniform3f(p.u("uColor"), cC[0], cC[1], cC[2])
+        GLES20.glUniform1f(p.u("uSpec"), spec)
+        GLES20.glUniform1f(p.u("uEmis"), emis)
+        mesh.draw(p, arrayOf("aPos:3", "aNrm:3"))
+    }
+
+    private fun drawScenery(si: ScenInst, night: Boolean) {
+        val u = si.s * ROAD_W * 0.15f
+        val x = si.x; val y = si.y; val z = si.z
+        val yaw = si.yaw
+        when (si.type) {
+            0 -> { // palm
+                drawObj(box, 0xFF6D4C41.toInt(), 0.1f, 0f, x, y + u * 0.55f, z, yaw, u * 0.05f, u * 1.1f, u * 0.05f)
+                for (k in 0 until 5) {
+                    val fy = yaw + k * 1.2566f
+                    drawObj(quad, 0xFF2E7D32.toInt(), 0.2f, 0f,
+                        x, y + u * 1.12f, z, fy, u * 0.55f, u * 0.10f, 1f)
+                }
+            }
+            1 -> drawObj(box, 0xFF78909C.toInt(), 0.15f, 0f, x, y + u * 0.15f, z, yaw + 0.7f, u * 0.42f, u * 0.3f, u * 0.38f)
+            2 -> { // billboard
+                drawObj(box, 0xFF37474F.toInt(), 0.1f, 0f, x, y + u * 0.45f, z, yaw, u * 0.04f, u * 0.9f, u * 0.04f)
+                drawObj(quad, 0xFF212121.toInt(), 0.2f, 0.15f, x, y + u * 1.05f, z, yaw + 1.5708f, u * 1.1f, u * 0.65f, 1f)
+            }
+            3 -> { // building
+                drawObj(box, 0xFF101020.toInt(), 0.1f, if (night) 0.18f else 0.02f, x, y + u * 1.3f, z, yaw, u * 0.8f, u * 2.6f, u * 0.8f)
+                drawObj(box, 0xFFFF1744.toInt(), 0.1f, if (night) 2.5f else 0f, x, y + u * 2.62f, z, yaw, u * 0.06f, u * 0.06f, u * 0.06f)
+            }
+            4 -> { // streetlight
+                drawObj(box, 0xFF37474F.toInt(), 0.1f, 0f, x, y + u * 0.75f, z, yaw, u * 0.03f, u * 1.5f, u * 0.03f)
+                drawObj(quad, 0xFFFFECB3.toInt(), 0f, if (night) 2.6f else 0.4f,
+                    x, y + u * 1.46f, z, yaw + 1.5708f, u * 0.14f, u * 0.1f, 1f)
+            }
+            5 -> { // pine
+                drawObj(box, 0xFF5D4037.toInt(), 0.1f, 0f, x, y + u * 0.12f, z, yaw, u * 0.04f, u * 0.25f, u * 0.04f)
+                drawObj(cone, 0xFF2E7D32.toInt(), 0.15f, 0f, x, y + u * 0.25f, z, yaw, u * 0.5f, u * 1.4f, u * 0.5f)
+            }
+            6 -> { // cactus
+                drawObj(box, 0xFF388E3C.toInt(), 0.15f, 0f, x, y + u * 0.45f, z, yaw, u * 0.07f, u * 0.9f, u * 0.07f)
+                drawObj(box, 0xFF2E7D32.toInt(), 0.15f, 0f, x - u * 0.2f, y + u * 0.62f, z, yaw, u * 0.28f, u * 0.06f, u * 0.06f)
+                drawObj(box, 0xFF2E7D32.toInt(), 0.15f, 0f, x - u * 0.33f, y + u * 0.75f, z, yaw, u * 0.06f, u * 0.2f, u * 0.06f)
+                drawObj(box, 0xFF2E7D32.toInt(), 0.15f, 0f, x + u * 0.2f, y + u * 0.52f, z, yaw, u * 0.28f, u * 0.06f, u * 0.06f)
+                drawObj(box, 0xFF2E7D32.toInt(), 0.15f, 0f, x + u * 0.33f, y + u * 0.66f, z, yaw, u * 0.06f, u * 0.2f, u * 0.06f)
+            }
+            7 -> { // overhead gantry spanning the road
+                val lX = -cos(yaw)
+                val lZ = sin(yaw)
+                val px1 = x + lX * ROAD_W * 1.18f
+                val pz1 = z + lZ * ROAD_W * 1.18f
+                val px2 = x - lX * ROAD_W * 1.18f
+                val pz2 = z - lZ * ROAD_W * 1.18f
+                drawObj(box, 0xFF37474F.toInt(), 0.2f, 0f, px1, y + 320f, pz1, yaw, 70f, 640f, 70f)
+                drawObj(box, 0xFF37474F.toInt(), 0.2f, 0f, px2, y + 320f, pz2, yaw, 70f, 640f, 70f)
+                drawObj(box, 0xFF212121.toInt(), 0.2f, 0f, x, y + 700f, z, 3.14159f - yaw, ROAD_W * 1.32f, 55f, 45f)
+                drawObj(box, 0xFFFF6D00.toInt(), 0.2f, if (night) 2.2f else 0.6f, x, y + 645f, z, 3.14159f - yaw, ROAD_W * 1.28f, 16f, 30f)
+            }
+            else -> { // chevron board
+                drawObj(box, 0xFF0A0A0C.toInt(), 0.1f, 0f, x, y + u * 0.5f, z, yaw, u * 0.04f, u * 1.0f, u * 0.04f)
+                drawObj(quad, 0xFFFFC107.toInt(), 0.1f, if (night) 1.6f else 0.5f, x, y + u * 1.05f, z, yaw + 1.5708f, u * 0.55f, u * 0.3f, 1f)
+            }
+        }
+    }
+
+    private fun drawCar(spec: CarSpec, x: Float, y: Float, z: Float, yaw: Float) {
+        val paint = PAINTS[spec.paint % PAINTS.size]
+        val specStr = when (spec.finish % 4) {
+            0 -> 0.25f
+            1 -> 0.7f
+            2 -> 1.5f
+            else -> 1.9f
+        }
+        val cw = if (spec.chassis == 2) 0.98f else if (spec.chassis == 1) 1.08f else 1f
+        val cl = if (spec.chassis == 2) 1.12f else if (spec.chassis == 1) 1.04f else 1f
+        val ch = if (spec.chassis == 2) 0.82f else 1f
+        val s = carScale
+        val glass = 0xFF1A2430.toInt()
+        val dark = 0xFF18181C.toInt()
+        val cy = cos(yaw)
+        val sn = sin(yaw)
+        // body + cabin
+        drawObj(carBody, paint, specStr, 0f, x, y, z, yaw, s * cw, s * ch, s * cl)
+        drawObj(carCabin, glass, 1.2f, 0f, x, y, z, yaw, s * cw, s * ch, s * cl)
+        // wheels at car-local offsets, transformed into world space
+        for (lx in floatArrayOf(-0.88f, 0.88f)) {
+            for (lz in floatArrayOf(1.45f, -1.5f)) {
+                val wx = x + (lx * cy + lz * sn) * s
+                val wz = z + (lz * cy - lx * sn) * s
+                drawObj(wheel, dark, 0.2f, 0f, wx, y + 0.34f * s * ch, wz, yaw, 0.6f * s, 0.72f * s, 0.72f * s)
+            }
+        }
+        // spoiler at car-local (0, hy, -2.05)
+        if (spec.spoiler > 0) {
+            val big = spec.spoiler == 2
+            val hy = if (big) 1.25f else 0.92f
+            val wx = x + (-2.05f * sn) * s * cl
+            val wz = z + (-2.05f * cy) * s * cl
+            drawObj(box, dark, 0.3f, 0f, wx, y + hy * s * ch, wz, yaw,
+                (if (big) 0.85f else 0.7f) * s, 0.06f * s, (if (big) 0.22f else 0.16f) * s)
+        }
+    }
+}
+
 // ------------------------- game view -------------------------
 
 class GameView(context: Context) : View(context) {
@@ -705,22 +1544,22 @@ class GameView(context: Context) : View(context) {
         const val SCR_RESULTS = 5
     }
 
-    private val save = Save(context)
+    internal val save = Save(context)
     private val rng = Rng(20261028)
     private var w = 0f
     private var h = 0f
     private var screen = SCR_MENU
     private var lastT = 0L
-    private var time = 0f
+    internal var time = 0f
 
     // garage
     private var tab = 0
     private val previewSpec = CarSpec()
 
     // race
-    private var track: Track? = null
-    private var playerPos = 0f
-    private var playerX = 0f
+    internal var track: Track? = null
+    internal var playerPos = 0f
+    internal var playerX = 0f
     private var speed = 0f
     private var lapCount = 0
     private var raceTime = 0L
@@ -739,7 +1578,7 @@ class GameView(context: Context) : View(context) {
     private var resultPos = 1
     private var resultCoins = 0
     private var newRecord = false
-    private val npcs = ArrayList<Npc>()
+    internal val npcs = ArrayList<Npc>()
     private val particles = ArrayList<Particle>()
     private val snow = Array(90) { Particle(0f, 0f, 0f, 0f, 1f, 1f, 2f, 0xFFFFFFFF.toInt()) }
 
@@ -794,6 +1633,9 @@ class GameView(context: Context) : View(context) {
     private val font = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
 
     init { save.load() }
+
+    // active track for the GL renderer (null outside a race)
+    internal fun raceTrack(): Track? = if (screen == SCR_RACE) track else null
 
     override fun onSizeChanged(nw: Int, nh: Int, ow: Int, oh: Int) {
         w = nw.toFloat(); h = nh.toFloat()
@@ -1133,146 +1975,31 @@ class GameView(context: Context) : View(context) {
 
     private fun drawRace(c: Canvas) {
         val tr = track ?: return
-        val theme = tr.theme
-        val segs = tr.segments
-        val nSeg = segs.size
-        val baseIdx = U.mod((playerPos / SEG_LEN).toInt(), nSeg)
-        val basePct = (playerPos % SEG_LEN) / SEG_LEN
-        val baseSeg = segs[baseIdx]
-
-        ensureSky(tr.themeIdx)
-        paint.shader = skyShader
-        c.drawRect(0f, 0f, w, h * 0.62f, paint)
-        paint.shader = null
-
-        drawSky(c, theme)
-        drawMountains(c, theme)
-
-        var maxy = h
-        var x = 0f
-        var dx = -(baseSeg.curve * basePct)
-        val camY = playerY + CAM_H
-
-        val grassP = Paint()
-        val roadP = Paint()
-        val rumP = Paint()
-        val laneP = Paint()
-        val fogP = Paint()
-        val edgeP = Paint()
-        val startP = Paint(Paint.ANTI_ALIAS_FLAG)
-
-        for (i in 0 until DRAW_DIST) {
-            val seg = segs[U.mod(baseIdx + i, nSeg)]
-            val looped = seg.index < baseIdx
-            val camZ = playerPos - (if (looped) tr.length else 0f)
-            project(seg.p1, playerX * ROAD_W - x, camY, camZ)
-            project(seg.p2, playerX * ROAD_W - x - dx, camY, camZ)
-            val f = exp(-((i.toFloat() / DRAW_DIST) * (i.toFloat() / DRAW_DIST)) * 4.5f)
-            seg.clip = maxy
-            x += dx
-            dx += seg.curve
-
-            if (seg.p1.cam.z <= CAM_DEPTH || seg.p2.sy >= maxy || seg.p2.sy >= seg.p1.sy) {
-                segDrawn[i] = false
-                continue
-            }
-            val p1 = seg.p1; val p2 = seg.p2
-            val alt = (seg.index / RUMBLE_LEN) % 2 == 0
-            segFog[i] = f
-
-            grassP.color = if (alt) theme.grass1 else theme.grass2
-            c.drawRect(0f, p2.sy, w, p1.sy + 1f, grassP)
-            rumP.color = if (alt) theme.rumble1 else theme.rumble2
-            val r1 = p1.sw / 6f; val r2 = p2.sw / 6f
-            poly(c, p1.sx - p1.sw - r1, p1.sy, p1.sx - p1.sw, p1.sy, p2.sx - p2.sw, p2.sy, p2.sx - p2.sw - r2, p2.sy, rumP)
-            poly(c, p1.sx + p1.sw + r1, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx + p2.sw + r2, p2.sy, rumP)
-            roadP.color = if (alt) theme.road1 else theme.road2
-            poly(c, p1.sx - p1.sw, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx - p2.sw, p2.sy, roadP)
-            if (theme.night) { // glowing edge markers
-                edgeP.color = U.withA(theme.accent, if (alt) 140 else 85)
-                val e1 = p1.sw * 0.022f
-                val e2 = p2.sw * 0.022f
-                poly(c, p1.sx - p1.sw, p1.sy, p1.sx - p1.sw + e1, p1.sy, p2.sx - p2.sw + e2, p2.sy, p2.sx - p2.sw, p2.sy, edgeP)
-                poly(c, p1.sx + p1.sw - e1, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx + p2.sw - e2, p2.sy, edgeP)
-            }
-            if (seg.index == 1) {
-                startP.color = 0xFFEEEEEE.toInt()
-                poly(c, p1.sx - p1.sw, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx - p2.sw, p2.sy, startP)
-            } else if (seg.index == 2) {
-                startP.color = 0xFF222222.toInt()
-                poly(c, p1.sx - p1.sw, p1.sy, p1.sx + p1.sw, p1.sy, p2.sx + p2.sw, p2.sy, p2.sx - p2.sw, p2.sy, startP)
-            }
-            if (alt) {
-                laneP.color = theme.lane
-                val lw1 = p1.sw / 34f; val lw2 = p2.sw / 34f
-                for (ln in 1 until 3) {
-                    val la = -1f + ln * (2f / 3f)
-                    val lx1 = p1.sx + p1.sw * la; val lx2 = p2.sx + p2.sw * la
-                    poly(c, lx1 - lw1, p1.sy, lx1 + lw1, p1.sy, lx2 + lw2, p2.sy, lx2 - lw2, p2.sy, laneP)
-                }
-            }
-            if (f < 1f) {
-                fogP.color = U.withA(theme.fog, ((1f - f) * 255).toInt())
-                c.drawRect(0f, p2.sy, w, p1.sy + 1f, fogP)
-            }
-
-            segX[i] = p1.sx; segY[i] = p1.sy; segW[i] = p1.sw; segClip[i] = seg.clip
-            segDrawn[i] = true
-            maxy = p2.sy
-        }
-
-        // scenery & NPC cars, far -> near
-        for (i in DRAW_DIST - 1 downTo 2) {
-            if (!segDrawn[i]) continue
-            val seg = segs[U.mod(baseIdx + i, nSeg)]
-            val a = (segFog[i] * 255).toInt()
-            for (sp in seg.sprites) {
-                val sx = segX[i] + segW[i] * sp.offset
-                val sc = segW[i] * 0.15f * sp.scale
-                if (segY[i] < segClip[i] + 4f) drawScenery(c, sp.type, sx, segY[i], sc, a, theme, sp.offset)
-            }
-            val npc = npcAtSeg[i]
-            if (npc != null) {
-                val t = (npc.z % SEG_LEN) / SEG_LEN
-                val hasNext = i + 1 < DRAW_DIST && segDrawn[i + 1]
-                val cx2 = if (hasNext) U.lerp(segX[i], segX[i + 1], t) else segX[i]
-                val cy2 = if (hasNext) U.lerp(segY[i], segY[i + 1], t) else segY[i]
-                val cw = if (hasNext) U.lerp(segW[i], segW[i + 1], t) else segW[i]
-                if (cy2 < segClip[i] + 2f) {
-                    CarArt.draw(c, npc.spec, cx2 + cw * npc.offset, cy2,
-                        cw * 0.0032f, 0f, 0f, false, false, theme.night, time, true)
-                }
-            }
-        }
-
-        if (theme.snow) {
+        // The 3D scene (sky, road, scenery, cars, fog) is rendered by
+        // RaceRenderer into the GL surface behind this view. Here we only
+        // draw the weather / particle overlay and the HUD.
+        if (tr.theme.snow) {
             val sp = Paint(Paint.ANTI_ALIAS_FLAG)
             sp.color = U.withA(0xFFFFFFFF.toInt(), 150)
             for (s in snow) c.drawCircle(s.x, s.y, s.size, sp)
         }
-        if (theme.rain) {
+        if (tr.theme.rain) {
             val rp = Paint(Paint.ANTI_ALIAS_FLAG)
             rp.color = U.withA(0xFF9FC9E8.toInt(), 110)
             rp.strokeWidth = 2.2f
             for (s in snow) c.drawLine(s.x, s.y, s.x + 1.5f, s.y + s.size * 6f, rp)
         }
-
+        if (tr.theme.lightning && flash > 0f) {
+            val fa = (U.clamp(flash, 0f, 0.45f) / 0.45f * 220f).toInt()
+            paint.reset()
+            paint.isAntiAlias = true
+            paint.color = U.withA(0xFFCFE8FF.toInt(), fa)
+            c.drawRect(0f, 0f, w, h, paint)
+        }
         for (pt in particles) {
             paint.color = U.withA(pt.color, (pt.life / pt.maxLife * 200).toInt())
             c.drawCircle(pt.x, pt.y, pt.size, paint)
         }
-
-        // player car
-        val steer = (if (steerR) 1f else 0f) - (if (steerL) 1f else 0f)
-        val bounce = abs(sin(time * 34f)) * (speed / BASE_MAX_SPEED) * 2.2f
-        val offroad = abs(playerX) > 1.05f && speed > BASE_MAX_SPEED * 0.3f
-        val shake = if (offroad) (rng.next() - 0.5f) * (speed / BASE_MAX_SPEED) * 8f else 0f
-        c.save()
-        c.translate(shake, shake * 0.6f)
-        CarArt.draw(c, save.spec, w / 2f, h - h * 0.055f, w * 0.0021f,
-            steer, bounce, boosting, brakeHeld, theme.night, time, true)
-        c.restore()
-
         if (boosting) {
             val lp = Paint(Paint.ANTI_ALIAS_FLAG)
             lp.color = U.withA(0xFFFFFFFF.toInt(), 80)
@@ -1285,15 +2012,6 @@ class GameView(context: Context) : View(context) {
                 c.drawLine(x0, y0, w / 2f + sin(ang) * r0 * 0.72f, h * 0.55f + cos(ang) * r0 * 0.52f, lp)
             }
         }
-
-        if (theme.lightning && flash > 0f) {
-            val fa = (U.clamp(flash, 0f, 0.45f) / 0.45f * 220f).toInt()
-            paint.reset()
-            paint.isAntiAlias = true
-            paint.color = U.withA(0xFFCFE8FF.toInt(), fa)
-            c.drawRect(0f, 0f, w, h, paint)
-        }
-
         drawHud(c)
         if (countdown > 0f) drawCountdown(c)
         if (paused) drawPause(c)

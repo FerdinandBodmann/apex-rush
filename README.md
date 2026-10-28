@@ -1,25 +1,31 @@
 # APEX RUSH 🏁
 
-Arcade car racing game for Android — a **single-file Kotlin app** with a pseudo-3D (OutRun-style)
-renderer, deep car customization, upgrades, AI opponents, drift & nitro mechanics, and saved
-progress. **No assets, no external dependencies** — every graphic is drawn procedurally with
-`android.graphics.Canvas`.
+Arcade car racing game for Android — a **single-file Kotlin app** with a **real OpenGL ES 3D
+engine**: GLSL shaders, true perspective rendering, per-fragment fog, Blinn-Phong lighting with
+metallic/gloss/matte paint, a procedural sky shader (sun glare, drifting clouds, twinkling stars),
+plus deep car customization, upgrades, AI opponents, drift & nitro mechanics and saved progress.
+**No assets, no external dependencies.**
 
 ## Features
 
-- 🖥️ **Pseudo-3D renderer** — curves, hills, fog, glowing night edge markers, 280-segment draw distance
-- 🗺️ **Real circuit maps** — every track's minimap is computed from its actual curvature geometry
-  (integrated into a driven 2D path), shown in track select and as a live in-race minimap with
-  player + rival dots
-- 🏁 **6 tracks** — Sunset Coast, Neon City, Alpine Pass, Desert Heat, Emerald Forest, Midnight Storm —
-  each with its own theme, layout, scenery and difficulty rating
-- 🌧️ **Weather** — rain on forest/storm tracks, lightning flashes on Midnight Storm, snowfall on Alpine Pass
-- 🚧 **3D track furniture** — overhead start/finish gantries you drive under, chevron corner boards on
-  sharp bends, palms, pines, cacti, buildings, streetlights, billboards
-- 🚗 **Garage & deep customization** — 3 chassis, 16 paints, 4 finishes, 5 rim styles, spoilers, stripes, neon glow
+- 🖥️ **OpenGL ES 3D engine** — the track is a real mesh in world space (circuit centerline +
+  elevation), rendered with GLSL shaders: procedural asphalt with rumble strips and lane markings,
+  distance fog, sun lighting on hills, glowing night edge markers
+- 🎨 **Shader car paint** — Blinn-Phong specular + fresnel per paint finish: matte, gloss, metallic,
+  chameleon; low-poly 3D cars (body, glass cabin, wheels, spoilers) with per-chassis proportions
+- 🌅 **Procedural sky shader** — gradient dome, sun disc with glare, value-noise clouds, twinkling
+  stars at night
+- 🗺️ **Real circuit maps** — every track's minimap is computed from its actual curvature geometry,
+  shown in track select and as a live in-race minimap with player + rival dots
+- 🏁 **6 tracks** — Sunset Coast, Neon City, Alpine Pass, Desert Heat, Emerald Forest, Midnight Storm
+- 🌧️ **Weather** — rain, lightning flashes, snowfall
+- 🚧 **3D track furniture** — start/finish gantries you drive under, chevron corner boards, palms,
+  pines, cacti, buildings, streetlights, billboards
+- 🚗 **Garage & deep customization** — 3 chassis, 16 paints, 4 finishes, 5 rim styles, spoilers,
+  stripes, neon glow
 - ⬆️ **Upgrade system** — engine, turbo, tires; performance changes how the car drives
-- 💨 **Drift & nitro mechanics** with a points system
-- 💾 **Saved progress** — money, upgrades, customization and per-track best times stored locally
+- 💨 **Drift & nitro mechanics**
+- 💾 **Saved progress** — money, upgrades, customization and per-track best times
 
 ## Build
 
@@ -56,6 +62,7 @@ gradle wrapper --gradle-version 8.7   # once
 | Piece | Choice |
 | --- | --- |
 | Language | Kotlin 2.0.20 |
+| 3D renderer | OpenGL ES 2.0 + custom GLSL (GLES20, GLSurfaceView) |
 | Build | Gradle 8.7 / AGP 8.5.2 |
 | SDK | compileSdk 34, minSdk 24, targetSdk 34 |
 | JDK | 17+ |
@@ -64,7 +71,7 @@ gradle wrapper --gradle-version 8.7   # once
 ## Project layout
 
 ```
-app/src/main/java/com/bodmannferdinand/apexrush/MainActivity.kt   # the whole game
+app/src/main/java/com/bodmannferdinand/apexrush/MainActivity.kt   # the whole game + 3D engine
 app/src/main/AndroidManifest.xml
 app/build.gradle.kts
 build.gradle.kts / settings.gradle.kts / gradle.properties

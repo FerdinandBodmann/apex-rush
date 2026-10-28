@@ -11,8 +11,8 @@ android {
         applicationId = "com.bodmannferdinand.apexrush"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     buildTypes {
@@ -32,7 +32,8 @@ android {
 }
 
 // Intentionally empty: the game has zero external dependencies —
-// all graphics are procedural (android.graphics.Canvas) and
-// persistence uses the built-in SharedPreferences + org.json.
+// the 3D engine is raw OpenGL ES 2.0 with hand-written GLSL shaders,
+// UI is drawn with android.graphics.Canvas, and persistence uses
+// built-in SharedPreferences + org.json.
 dependencies {
 }
